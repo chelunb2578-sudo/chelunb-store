@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+威胁情报关键词提取 - 完整分析脚本（2021-2025近五年）
+数据来源：CVE.org 5.0 格式 JSON
+分析对象：Web应用相关漏洞
+分析方法：TF-IDF + 跨年趋势分析
+"""
+
+import os
+import json
+import re
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# ===== 新增：用于趋势分析的库 =====
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
+    print("警告：seaborn未安装，热力图将跳过")
+
+# 可选：词云（用于可视化增强，但不强制）
+try:
+    from wordcloud import WordCloud
+    HAS_WORDCLOUD = True
+except ImportError:
+    HAS_WORDCLOUD = False
+
+warnings.filterwarnings('ignore')
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+print("=" * 60)
+print("威胁情报关键词提取分析（2021-2025近五年）")
+print("=" * 60)
+
+# =============================================================================
+# 第一步：只读取2021-2025年份文件夹里的JSON，并记录年份
+# =============================================================================
+print("\n【步骤1】读取2021-2025年份的CVE详情文件...")
+
+base_path = r'C:\Users\Hu Kioskky\Downloads\cvelistV5-main\cves'
+
+target_years = ['2021', '2022', '2023', '2024', '2025']
+all_json_files = []
+
+for year in target_years:
+    year_path = os.path.join(base_path, year)
+    if os.path.exists(year_path) and os.path.isdir(year_path):
+        for root, dirs, files in os.walk(year_path):
+            for file in files:
+                if file.endswith('.json'):
+                    all_json_files.append(os.path.join(root, file))
+        print(f"  {year}年: 找到 {len([f for f in all_json_files if f'/{year}/' in f or f'\\{year}\\' in f])} 个文件")
+    else:
+        print(f"  ⚠️  {year}年文件夹不存在，跳过")
+
+print(f"\n共找到 {len(all_json_files)} 个JSON文件（2021-2025）")
+
+if len(all_json_files) == 0:
+    print("❌ 没有找到任何JSON文件，请检查路径是否正确")
+    exit()
+
+MAX_FILES = 0
+if MAX_FILES > 0 and len(all_json_files) > MAX_FILES:
+    print(f"由于数据量较大，只读取前{MAX_FILES}个文件（可修改MAX_FILES调整）")
+    all_json_files = all_json_files[:MAX_FILES]
+else:
+    print(f"准备读取全部 {len(all_json_files)} 个文件...")
+
+raw_data = []
+failed_files = []
+
+for i, file_path in enumerate(all_json_files):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            cve_data = json.load(f)
+
+        cve_id = cve_data.get('cveMetadata', {}).get('cveId', 'Unknown')
+
+        # ===== 新增：从CVE ID提取年份 =====
+        if cve_id.startswith('CVE-'):
+            year = cve_id.split('-')[1]
+        else:
+            year = 'unknown'
+
+        description = ""
+        try:
+            containers = cve_data.get('containers', {})
+            cna = containers.get('cna', {})
+            desc_list = cna.get('descriptions', [])
+            if desc_list:
+                for d in desc_list:
+                    if d.get('lang') == 'en':
+                        description = d.get('value', '')
+                        break
+                if not description and desc_list:
+                    description = desc_list[0].get('value', '')
+        except:
+            pass
+
+        if not description:
+            try:
+                desc_list = cve_data.get('descriptions', [])
+                if desc_list:
+                    description = desc_list[0].get('value', '')
+            except:
+                pass
+
+        if description and len(description) > 10:
+            raw_data.append({
+                'Name': cve_id,
+                'Description': description,
+                'Year': year   # ===== 新增年份字段 =====
+            })
+
+        if (i + 1) % 500 == 0:
+            print(f"  已处理 {i + 1}/{len(all_json_files)}，成功 {len(raw_data)} 条")
+
+    except Exception as e:
+        failed_files.append((file_path, str(e)))
+
+print(f"\n✅ 成功读取 {len(raw_data)} 条CVE记录（近五年）")
+if failed_files:
+    print(f"⚠️  失败 {len(failed_files)} 个文件")
+
+df = pd.DataFrame(raw_data)
+print(f"\n📊 原始数据：{len(df)} 条")
+print(f"年份分布：\n{df['Year'].value_counts().sort_index()}")
+
+# =============================================================================
+# 第二步：筛选Web相关CVE
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤2】筛选Web相关CVE...")
+
+web_keywords = [
+    'sql', 'injection', 'xss', 'cross-site', 'scripting', 'csrf',
+    'traversal', 'execution', 'rce', 'command', 'bypass', 'escalation',
+    'disclosure', 'denial', 'overflow', 'web', 'http', 'https', 'php',
+    'javascript', 'apache', 'nginx', 'tomcat', 'wordpress', 'drupal',
+    'cms', 'database', 'oracle', 'mysql', 'postgres', 'mongo',
+    'authentication', 'privilege', 'credential', 'password', 'session',
+    'cookie', 'header', 'request', 'response', 'url', 'uri', 'endpoint',
+    'api', 'rest', 'graphql', 'soap', 'xml', 'json', 'html', 'css',
+    'upload', 'download', 'file', 'path', 'directory', 'folder'
+]
+
+pattern = '|'.join([re.escape(kw) for kw in web_keywords])
+
+df['is_web'] = df['Description'].str.contains(pattern, case=False, na=False)
+web_df = df[df['is_web']].copy()
+
+print(f"📊 Web相关：{len(web_df)} 条，占比 {len(web_df) / len(df) * 100:.1f}%")
+
+if len(web_df) == 0:
+    print("⚠️ 未找到Web相关，使用全部数据")
+    web_df = df.copy()
+
+web_df.to_csv('step2_web_cves_2021_2025.csv', index=False)
+print("已保存至：step2_web_cves_2021_2025.csv")
+
+# =============================================================================
+# 第三步：数据清洗与预处理（终极优化版 - 专注攻击技术）
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤3】数据清洗与预处理（终极优化版）...")
+
+ultimate_stopwords = {
+    'vulnerability', 'vulnerable', 'user', 'users', 'attacker', 'attackers',
+    'attack', 'allows', 'allow', 'via', 'issue', 'issues', 'affected',
+    'affect', 'affects', 'versions', 'version', 'prior', 'before', 'after',
+    'could', 'can', 'may', 'might', 'cause', 'caused', 'lead', 'leads',
+    'result', 'results', 'using', 'use', 'used', 'remote', 'local',
+    'unspecified', 'unknown', 'certain', 'multiple', 'arbitrary',
+    'sensitive', 'malicious', 'crafted', 'specially', 'specially crafted',
+    'file', 'files', 'code', 'access', 'site', 'sites', 'system', 'systems',
+    'web', 'application', 'applications', 'server', 'service', 'services',
+    'data', 'information', 'resource', 'resources', 'component', 'module',
+    'function', 'functions', 'feature', 'features', 'parameter', 'parameters',
+    'input', 'inputs', 'output', 'request', 'response', 'http', 'https',
+    'network', 'networks', 'protocol', 'interface', 'default', 'configuration',
+    'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her',
+    'was', 'one', 'our', 'out', 'has', 'him', 'his', 'how', 'its', 'may',
+    'new', 'now', 'old', 'see', 'two', 'who', 'did', 'she', 'use', 'way',
+    'many', 'any', 'say', 'man', 'try', 'ask', 'end', 'why', 'let', 'put',
+    'tell', 'very', 'when', 'come', 'here', 'look', 'make', 'seem', 'over',
+    'such', 'take', 'than', 'them', 'well', 'were', 'your', 'about', 'could',
+    'other', 'after', 'first', 'never', 'these', 'think', 'where', 'being',
+    'every', 'great', 'might', 'shall', 'still', 'while', 'this', 'that',
+    'with', 'have', 'from', 'they', 'know', 'want', 'been', 'good', 'much',
+    'some', 'time', 'would', 'there', 'which', 'their', 'what', 'said', 'each',
+    'will', 'also', 'does', 'did', 'through', 'should', 'product', 'products',
+    'vendor', 'vendors', 'developer', 'developers'
+}
+
+
+def preprocess_text_v3(text):
+    if pd.isna(text):
+        return ""
+
+    text = re.sub(r'cross[\s-]?site[\s-]?scripting', 'xss_attack', text, flags=re.IGNORECASE)
+    text = re.sub(r'cross[\s-]?site', 'xss_attack', text, flags=re.IGNORECASE)
+    text = re.sub(r'sql[\s-]?injection', 'sql_injection', text, flags=re.IGNORECASE)
+    text = re.sub(r'sql[\s-]?command', 'sql_injection', text, flags=re.IGNORECASE)
+    text = re.sub(r'path[\s-]?traversal|directory[\s-]?traversal', 'path_traversal', text, flags=re.IGNORECASE)
+    text = re.sub(r'remote[\s-]?code[\s-]?execution', 'rce', text, flags=re.IGNORECASE)
+    text = re.sub(r'command[\s-]?injection', 'command_injection', text, flags=re.IGNORECASE)
+    text = re.sub(r'file[\s-]?upload', 'file_upload', text, flags=re.IGNORECASE)
+    text = re.sub(r'file[\s-]?inclusion', 'file_inclusion', text, flags=re.IGNORECASE)
+    text = re.sub(r'buffer[\s-]?overflow', 'buffer_overflow', text, flags=re.IGNORECASE)
+    text = re.sub(r'privilege[\s-]?escalation', 'privilege_escalation', text, flags=re.IGNORECASE)
+    text = re.sub(r'authentication[\s-]?bypass', 'auth_bypass', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'CVE-\d{4}-\d{4,}', ' ', text)
+    text = re.sub(r'\d+\.\d+(\.\d+)*', ' ', text)
+    text = re.sub(r'http[s]?://\S+', ' ', text)
+    text = re.sub(r'\S+@\S+', ' ', text)
+
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    words = [w for w in text.split()
+             if len(w) > 2
+             and w not in ultimate_stopwords
+             and not w.isdigit()]
+
+    return ' '.join(words)
+
+
+web_df['processed'] = web_df['Description'].apply(preprocess_text_v3)
+
+valid_mask = web_df['processed'].str.len() > 0
+web_df = web_df[valid_mask].copy()
+
+print(f"✅ 预处理完成：{len(web_df)} 条有效记录")
+
+web_df[['Name', 'Description', 'processed', 'Year']].to_csv('step3_processed_2021_2025.csv', index=False)
+print("预处理结果已保存至：step3_processed_2021_2025.csv")
+
+# =============================================================================
+# 第四步：描述性统计
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤4】描述性统计...")
+
+web_df['text_length'] = web_df['Description'].str.len()
+web_df['word_count'] = web_df['processed'].str.split().str.len()
+
+print(f"样本量：{len(web_df)}")
+print(f"平均长度：{web_df['text_length'].mean():.1f} 字符")
+print(f"平均词数：{web_df['word_count'].mean():.1f} 词")
+
+stats_df = pd.DataFrame({
+    '指标': ['样本量', '平均长度(字符)', '中位数长度(字符)',
+             '最短', '最长', '平均词数', '中位数词数'],
+    '数值': [
+        len(web_df),
+        round(web_df['text_length'].mean(), 1),
+        round(web_df['text_length'].median(), 1),
+        web_df['text_length'].min(),
+        web_df['text_length'].max(),
+        round(web_df['word_count'].mean(), 1),
+        round(web_df['word_count'].median(), 1)
+    ]
+})
+stats_df.to_csv('step4_statistics_2021_2025.csv', index=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(web_df['text_length'], bins=30, color='skyblue', edgecolor='black')
+axes[0].set_title('Text Length Distribution')
+axes[0].set_xlabel('Character Count')
+axes[0].set_ylabel('Frequency')
+
+axes[1].hist(web_df['word_count'], bins=30, color='lightgreen', edgecolor='black')
+axes[1].set_title('Word Count Distribution')
+axes[1].set_xlabel('Word Count')
+
+plt.tight_layout()
+plt.savefig('step4_distribution_2021_2025.png', dpi=300)
+print("图表已保存至：step4_distribution_2021_2025.png")
+
+# =============================================================================
+# 第五步：TF-IDF关键词提取（整体五年）
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤5】TF-IDF关键词提取（整体五年）...")
+
+n_samples = len(web_df)
+print(f"使用 {n_samples} 条记录进行分析")
+
+vectorizer = TfidfVectorizer(
+    max_features=100,
+    ngram_range=(2, 2),
+    min_df=3 if n_samples > 30 else 2,
+    max_df=0.5,
+    stop_words=None,
+    token_pattern=r'\b[a-zA-Z_]+\b'
+)
+
+try:
+    tfidf_matrix = vectorizer.fit_transform(web_df['processed'])
+    feature_names = vectorizer.get_feature_names_out()
+    if len(feature_names) < 10:
+        raise ValueError("特征太少")
+except Exception as e:
+    print(f"严格模式特征不足，切换到宽松模式...")
+    vectorizer = TfidfVectorizer(
+        max_features=100,
+        ngram_range=(1, 2),
+        min_df=2,
+        max_df=0.6,
+        stop_words=None
+    )
+    tfidf_matrix = vectorizer.fit_transform(web_df['processed'])
+    feature_names = vectorizer.get_feature_names_out()
+
+print(f"提取到 {len(feature_names)} 个特征词")
+
+mean_scores = np.mean(tfidf_matrix.toarray(), axis=0)
+
+top_n = min(30, len(feature_names))
+top_indices = mean_scores.argsort()[-top_n:][::-1]
+top_keywords = [(feature_names[i], mean_scores[i]) for i in top_indices]
+
+print(f"\nTop-{top_n} 关键词（攻击技术 focused）：")
+print("-" * 50)
+for i, (word, score) in enumerate(top_keywords, 1):
+    print(f"{i:2d}. {word:30s} {score:.4f}")
+
+keywords_df = pd.DataFrame(top_keywords, columns=['Keyword', 'TF-IDF_Score'])
+keywords_df.to_csv('step5_keywords_2021_2025_optimized.csv', index=False)
+
+plt.figure(figsize=(12, 10))
+words = [w for w, _ in top_keywords]
+scores = [s for _, s in top_keywords]
+plt.barh(range(len(words)), scores, color='steelblue')
+plt.yticks(range(len(words)), words)
+plt.xlabel('TF-IDF Score')
+plt.title(f'Top-{top_n} Attack Technique Keywords (2021-2025)')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig('step5_keywords_2021_2025_optimized.png', dpi=300)
+print("图表已保存至：step5_keywords_2021_2025_optimized.png")
+
+# =============================================================================
+# 第六步：关键词分类分析
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤6】关键词分类分析...")
+
+category_rules = {
+    '攻击技术': ['injection', 'overflow', 'bypass', 'execution', 'xss', 'sql',
+                 'csrf', 'traversal', 'disclosure', 'denial', 'authentication', 'command'],
+    '受影响组件': ['web', 'server', 'php', 'apache', 'nginx', 'tomcat',
+                   'wordpress', 'drupal', 'cms', 'database', 'oracle', 'mysql', 'postgres'],
+    '攻击后果': ['information', 'arbitrary', 'unauthorized', 'privilege', 'access', 'remote'],
+    '其他': []
+}
+
+
+def classify_keyword(keyword):
+    for category, keywords in category_rules.items():
+        if any(kw in keyword for kw in keywords):
+            return category
+    return '其他'
+
+
+keywords_df['Category'] = keywords_df['Keyword'].apply(classify_keyword)
+
+category_stats = keywords_df.groupby('Category').agg({
+    'Keyword': 'count',
+    'TF-IDF_Score': 'sum'
+}).reset_index()
+category_stats.columns = ['Category', 'Count', 'Total_Score']
+category_stats['Percentage'] = category_stats['Count'] / len(keywords_df) * 100
+
+print("\n关键词分类统计：")
+print("-" * 50)
+print(category_stats.to_string(index=False))
+
+keywords_df.to_csv('step6_categorized_2021_2025.csv', index=False)
+
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.pie(category_stats['Count'], labels=category_stats['Category'],
+       autopct='%1.1f%%', startangle=90)
+ax.set_title('Keywords by Category (2021-2025)')
+plt.savefig('step6_pie_2021_2025.png', dpi=300)
+print("分类饼图已保存至：step6_pie_2021_2025.png")
+
+# =============================================================================
+# 第七步：单个文档关键词分析（示例）
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤7】单个文档关键词分析...")
+
+
+def get_doc_keywords(doc_idx, n=10):
+    row = tfidf_matrix[doc_idx].toarray()[0]
+    top_indices = row.argsort()[-n:][::-1]
+    return [(feature_names[i], row[i]) for i in top_indices if row[i] > 0]
+
+
+print("\n单个文档关键词示例：")
+for i in range(min(3, len(web_df))):
+    print(f"\n【文档 {i + 1}】: {web_df.iloc[i]['Name']}")
+    print(f"原始描述: {web_df.iloc[i]['Description'][:100]}...")
+    doc_keywords = get_doc_keywords(i, n=5)
+    print("Top-5 关键词:")
+    for word, score in doc_keywords:
+        print(f"  - {word}: {score:.4f}")
+
+# =============================================================================
+# 第八步：跨年趋势分析（新增）
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤8】跨年趋势分析...")
+
+# 获取实际存在的年份（排除unknown，并确保为2021-2025）
+years = sorted([y for y in web_df['Year'].unique() if y.isdigit() and 2021 <= int(y) <= 2025])
+print(f"分析年份: {years}")
+
+# 存储每年的Top关键词
+yearly_keywords = {}
+yearly_top10 = {}
+
+for year in years:
+    print(f"\n--- 分析 {year} 年数据 ---")
+    year_df = web_df[web_df['Year'] == year].copy()
+    if len(year_df) < 5:
+        print(f"{year} 年数据不足（{len(year_df)}条），跳过")
+        continue
+
+    # 对当年数据重新训练TF-IDF（使用相同的参数）
+    vectorizer_year = TfidfVectorizer(
+        max_features=50,
+        ngram_range=(2, 2),
+        min_df=2,
+        max_df=0.5,
+        stop_words=None,
+        token_pattern=r'\b[a-zA-Z_]+\b'
+    )
+    try:
+        tfidf_year = vectorizer_year.fit_transform(year_df['processed'])
+        feature_names_year = vectorizer_year.get_feature_names_out()
+        if len(feature_names_year) < 5:
+            raise ValueError("特征太少")
+    except Exception as e:
+        print(f"严格模式特征不足，切换到宽松模式...")
+        vectorizer_year = TfidfVectorizer(
+            max_features=50,
+            ngram_range=(1, 2),
+            min_df=2,
+            max_df=0.6,
+            stop_words=None
+        )
+        tfidf_year = vectorizer_year.fit_transform(year_df['processed'])
+        feature_names_year = vectorizer_year.get_feature_names_out()
+
+    mean_scores_year = np.mean(tfidf_year.toarray(), axis=0)
+
+    # 取Top-20（可调整）
+    top_n_year = min(20, len(feature_names_year))
+    top_indices_year = mean_scores_year.argsort()[-top_n_year:][::-1]
+    top_keywords_year = [(feature_names_year[i], mean_scores_year[i]) for i in top_indices_year]
+
+    yearly_keywords[year] = top_keywords_year
+    yearly_top10[year] = top_keywords_year[:10]  # 只保留前10用于报告
+
+    # 保存每年关键词
+    pd.DataFrame(top_keywords_year, columns=['Keyword', 'TF-IDF_Score']).to_csv(f'step8_keywords_{year}.csv', index=False)
+    print(f"{year}年Top-10:")
+    for i, (kw, sc) in enumerate(top_keywords_year[:10], 1):
+        print(f"  {i:2d}. {kw:30s} {sc:.4f}")
+
+# 生成趋势可视化（折线图+热力图）
+if len(yearly_keywords) >= 2:
+    # 收集所有关键词
+    all_keywords = set()
+    for year, kw_list in yearly_keywords.items():
+        for kw, _ in kw_list:
+            all_keywords.add(kw)
+
+    # 构建数据框，行=关键词，列=年份，值=TF-IDF得分
+    trend_data = []
+    for kw in all_keywords:
+        row = {'Keyword': kw}
+        for year in yearly_keywords:
+            score = 0.0
+            for yk, ys in yearly_keywords[year]:
+                if yk == kw:
+                    score = ys
+                    break
+            row[year] = score
+        trend_data.append(row)
+
+    trend_df = pd.DataFrame(trend_data).set_index('Keyword')
+    # 筛选在至少2年出现的关键词
+    trend_df = trend_df[(trend_df > 0).sum(axis=1) >= 2]
+    trend_df = trend_df.sort_index(axis=1)  # 按年份排序
+
+    # 保存趋势数据
+    trend_df.to_csv('step8_trend_data.csv')
+
+    # 折线图
+    plt.figure(figsize=(12, 6))
+    for kw in trend_df.index:
+        plt.plot(trend_df.columns.astype(str), trend_df.loc[kw], marker='o', label=kw)
+    plt.xlabel('Year')
+    plt.ylabel('TF-IDF Score')
+    plt.title('Keyword Trend Analysis (2021-2025)')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig('step8_trend_lines_2021_2025.png', dpi=300)
+    print("趋势折线图已保存至：step8_trend_lines_2021_2025.png")
+
+    # 热力图（如果seaborn可用）
+    if HAS_SEABORN:
+        plt.figure(figsize=(10, max(6, len(trend_df)*0.3)))
+        sns.heatmap(trend_df, annot=True, fmt='.3f', cmap='YlOrRd',
+                    cbar_kws={'label': 'TF-IDF Score'})
+        plt.title('Keyword TF-IDF Heatmap by Year')
+        plt.tight_layout()
+        plt.savefig('step8_trend_heatmap_2021_2025.png', dpi=300)
+        print("热力图已保存至：step8_trend_heatmap_2021_2025.png")
+    else:
+        print("seaborn未安装，跳过热力图")
+
+# =============================================================================
+# 第九步：生成完整报告（原第八步）
+# =============================================================================
+print("\n" + "=" * 60)
+print("【步骤9】生成分析报告...")
+
+# 构建报告内容
+report = f"""
+威胁情报关键词提取分析报告（2021-2025近五年）
+{'=' * 60}
+
+一、数据概况
+- 分析对象：CVE漏洞描述文本（2021-2025年）
+- 筛选条件：Web应用相关漏洞
+- 样本数量：{len(web_df)} 条
+- 平均长度：{web_df['text_length'].mean():.1f} 字符
+- 平均词数：{web_df['word_count'].mean():.1f} 词
+
+二、整体TF-IDF分析结果
+- 特征词数量：{len(feature_names)} 个
+- 提取关键词：Top-{top_n}
+
+三、关键词分类统计
+{category_stats.to_string(index=False)}
+
+四、Top-10 关键词（整体五年）
+"""
+for i, (word, score) in enumerate(top_keywords[:10], 1):
+    report += f"{i:2d}. {word} (TF-IDF: {score:.4f})\n"
+
+# ===== 新增：跨年趋势摘要 =====
+if yearly_top10:
+    report += "\n五、跨年趋势摘要（每年Top-3关键词）\n"
+    for year in sorted(yearly_top10.keys()):
+        report += f"{year}年: "
+        top3 = yearly_top10[year][:3]
+        terms = [f"{kw}({score:.3f})" for kw, score in top3]
+        report += ", ".join(terms) + "\n"
+
+report += f"""
+六、数据文件清单（2021-2025）
+- step2_web_cves_2021_2025.csv: 筛选后的Web相关CVE ({len(web_df)}条)
+- step3_processed_2021_2025.csv: 预处理后的数据
+- step4_statistics_2021_2025.csv: 描述性统计
+- step4_distribution_2021_2025.png: 文本长度分布图
+- step5_keywords_2021_2025.csv: TF-IDF关键词结果 (Top-{top_n})
+- step5_keywords_2021_2025.png: 关键词条形图
+- step6_categorized_2021_2025.csv: 分类后的关键词
+- step6_pie_2021_2025.png: 分类饼图
+- step8_keywords_YYYY.csv: 各年份单独的关键词文件（YYYY为年份）
+- step8_trend_data.csv: 趋势分析数据表
+- step8_trend_lines_2021_2025.png: 关键词趋势折线图
+- step8_trend_heatmap_2021_2025.png: 关键词热力图（若seaborn可用）
+- analysis_report_2021_2025.txt: 本报告
+"""
+
+with open('analysis_report_2021_2025.txt', 'w', encoding='utf-8') as f:
+    f.write(report)
+
+print("分析报告已保存至：analysis_report_2021_2025.txt")
+print("\n" + "=" * 60)
+print("✅ 分析完成！所有结果文件（2021-2025）：")
+print("  - step2_web_cves_2021_2025.csv")
+print("  - step3_processed_2021_2025.csv")
+print("  - step4_statistics_2021_2025.csv")
+print("  - step4_distribution_2021_2025.png")
+print("  - step5_keywords_2021_2025.csv")
+print("  - step5_keywords_2021_2025.png")
+print("  - step6_categorized_2021_2025.csv")
+print("  - step6_pie_2021_2025.png")
+print("  - step8_keywords_YYYY.csv (各年份)")
+print("  - step8_trend_data.csv")
+print("  - step8_trend_lines_2021_2025.png")
+if HAS_SEABORN:
+    print("  - step8_trend_heatmap_2021_2025.png")
+print("  - analysis_report_2021_2025.txt")
+print("=" * 60)
